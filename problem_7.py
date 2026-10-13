@@ -51,13 +51,107 @@ def _flash_attention_forward_swa_kernel(
     qk_scale = softmax_scale * 1.44269504
 
     # --- STUDENT IMPLEMENTATION REQUIRED HERE ---
-    # Combine the GQA, SWA, and Sink logic.
-    # Combine all code from previous problems, and add the sink logic.
-    # You should have 3 phases:
-    # 1. Phase 0: Sink blocks that are before the sliding window
-    # 2. Phase 1: Off-Diagonal Blocks (within the window)
-    # 3. Phase 2: Diagonal Blocks
-    pass
+    q_block_start = q_block_idx * BLOCK_M
+
+    # Block-aligned start of the sliding window, same idea as Problem 6.
+    window_start = tl.maximum(0, q_block_start - WINDOW_SIZE + 1)
+    window_start = (window_start // BLOCK_N) * BLOCK_N
+
+    # The sink tokens live at the very start of the sequence. Whenever the
+    # window already reaches back that far, those tokens are handled by the
+    # window loop instead, so Phase 0 should stop wherever the window begins.
+    sink_end = tl.minimum(SINK_SIZE, window_start)
+
+    # --- Phase 0: Sink Blocks ---
+    for start_n in range(0, sink_end, BLOCK_N):
+        k_offsets = start_n + tl.arange(0, BLOCK_N)
+        k_ptrs = K_ptr + batch_idx * k_stride_b + kv_head_idx * k_stride_h + \
+                 (k_offsets[None, :] * k_stride_s + tl.arange(0, HEAD_DIM)[:, None])
+        k_block = tl.load(k_ptrs, mask=k_offsets[None, :] < SEQ_LEN, other=0.0)
+
+        v_ptrs = V_ptr + batch_idx * v_stride_b + kv_head_idx * v_stride_h + \
+                 (k_offsets[:, None] * v_stride_s + tl.arange(0, HEAD_DIM)[None, :])
+        v_block = tl.load(v_ptrs, mask=k_offsets[:, None] < SEQ_LEN, other=0.0)
+
+        s_ij = tl.dot(q_block, k_block) * qk_scale
+
+        # Sink tokens always precede this query block, so only the sink
+        # boundary itself needs to be masked here.
+        is_sink = k_offsets[None, :] < SINK_SIZE
+        s_ij = tl.where(is_sink, s_ij, -float('inf'))
+
+        m_new = tl.maximum(m_i, tl.max(s_ij, axis=1))
+        alpha = tl.math.exp2(m_i - m_new)
+        acc *= alpha[:, None]
+        l_i *= alpha
+
+        p_ij = tl.math.exp2(s_ij - m_new[:, None])
+        l_i += tl.sum(p_ij, axis=1)
+        acc += tl.dot(p_ij.to(v_block.dtype), v_block)
+
+        m_i = m_new
+
+    # --- Phase 1: Off-Diagonal Blocks (within the window) ---
+    for start_n in range(window_start, q_block_start, BLOCK_N):
+        k_offsets = start_n + tl.arange(0, BLOCK_N)
+        k_ptrs = K_ptr + batch_idx * k_stride_b + kv_head_idx * k_stride_h + \
+                 (k_offsets[None, :] * k_stride_s + tl.arange(0, HEAD_DIM)[:, None])
+        k_block = tl.load(k_ptrs, mask=k_offsets[None, :] < SEQ_LEN, other=0.0)
+
+        v_ptrs = V_ptr + batch_idx * v_stride_b + kv_head_idx * v_stride_h + \
+                 (k_offsets[:, None] * v_stride_s + tl.arange(0, HEAD_DIM)[None, :])
+        v_block = tl.load(v_ptrs, mask=k_offsets[:, None] < SEQ_LEN, other=0.0)
+
+        s_ij = tl.dot(q_block, k_block) * qk_scale
+
+        # A key is valid if it's inside the sliding window OR it's a sink
+        # token. The sink check matters near the start of the sequence,
+        # where window_start can fall below SINK_SIZE for some rows in
+        # this block even though the block-level window_start already
+        # passed it.
+        in_window = (q_offsets[:, None] - k_offsets[None, :]) < WINDOW_SIZE
+        is_sink = k_offsets[None, :] < SINK_SIZE
+        s_ij = tl.where(in_window | is_sink, s_ij, -float('inf'))
+
+        m_new = tl.maximum(m_i, tl.max(s_ij, axis=1))
+        alpha = tl.math.exp2(m_i - m_new)
+        acc *= alpha[:, None]
+        l_i *= alpha
+
+        p_ij = tl.math.exp2(s_ij - m_new[:, None])
+        l_i += tl.sum(p_ij, axis=1)
+        acc += tl.dot(p_ij.to(v_block.dtype), v_block)
+
+        m_i = m_new
+
+    # --- Phase 2: Diagonal Block ---
+    for start_n in range(q_block_start, q_block_start + BLOCK_M, BLOCK_N):
+        k_offsets = start_n + tl.arange(0, BLOCK_N)
+        k_ptrs = K_ptr + batch_idx * k_stride_b + kv_head_idx * k_stride_h + \
+                 (k_offsets[None, :] * k_stride_s + tl.arange(0, HEAD_DIM)[:, None])
+        k_block = tl.load(k_ptrs, mask=k_offsets[None, :] < SEQ_LEN, other=0.0)
+
+        v_ptrs = V_ptr + batch_idx * v_stride_b + kv_head_idx * v_stride_h + \
+                 (k_offsets[:, None] * v_stride_s + tl.arange(0, HEAD_DIM)[None, :])
+        v_block = tl.load(v_ptrs, mask=k_offsets[:, None] < SEQ_LEN, other=0.0)
+
+        s_ij = tl.dot(q_block, k_block) * qk_scale
+
+        causal = q_offsets[:, None] >= k_offsets[None, :]
+        in_window = (q_offsets[:, None] - k_offsets[None, :]) < WINDOW_SIZE
+        is_sink = k_offsets[None, :] < SINK_SIZE
+        s_ij = tl.where(causal & (in_window | is_sink), s_ij, -float('inf'))
+
+        m_new = tl.maximum(m_i, tl.max(s_ij, axis=1))
+        alpha = tl.math.exp2(m_i - m_new)
+        acc *= alpha[:, None]
+        l_i *= alpha
+
+        p_ij = tl.math.exp2(s_ij - m_new[:, None])
+        l_i += tl.sum(p_ij, axis=1)
+        acc += tl.dot(p_ij.to(v_block.dtype), v_block)
+
+        m_i = m_new
     # --- END OF STUDENT IMPLEMENTATION ---
 
     # 4. Normalize and write the final output block.

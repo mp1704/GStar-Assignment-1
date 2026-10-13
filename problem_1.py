@@ -54,20 +54,28 @@ class FlashAttention2Function(torch.autograd.Function):
                         V_tile = V_bh[k_start:k_end, :]
                         
                         S_ij = (Q_tile @ K_tile.transpose(-1, -2)) * scale
-                        
+
                         # --- STUDENT IMPLEMENTATION REQUIRED HERE ---
-                        # 1. Apply causal masking if is_causal is True.
-                        #
-                        # 2. Compute the new running maximum
-                        #
-                        # 3. Rescale the previous accumulators (o_i, l_i)
-                        #
-                        # 4. Compute the probabilities for the current tile, P_tilde_ij = exp(S_ij - m_new).
-                        #
-                        # 5. Accumulate the current tile's contribution to the accumulators to update l_i and o_i
-                        #
-                        # 6. Update the running max for the next iteration
-                        
+                        if is_causal:
+                            q_idx = torch.arange(q_start, q_end, device=Q.device).unsqueeze(1)
+                            k_idx = torch.arange(k_start, k_end, device=Q.device).unsqueeze(0)
+                            S_ij = S_ij.masked_fill(q_idx < k_idx, -float('inf'))
+
+                        # New running maximum over the combined (old + current tile) scores
+                        m_ij = torch.max(S_ij, dim=-1).values
+                        m_new = torch.maximum(m_i, m_ij)
+
+                        # Rescale factor to bring the old accumulators up to date with m_new
+                        alpha = torch.exp(m_i - m_new)
+
+                        # Unnormalized probabilities for this tile, shifted by the new max
+                        P_tilde_ij = torch.exp(S_ij - m_new.unsqueeze(-1))
+
+                        # Update the running sum and output accumulators
+                        l_i = alpha * l_i + P_tilde_ij.sum(dim=-1)
+                        o_i = alpha.unsqueeze(-1) * o_i + P_tilde_ij @ V_tile
+
+                        m_i = m_new
                         # --- END OF STUDENT IMPLEMENTATION ---
 
                     # After iterating through all key tiles, normalize the output
