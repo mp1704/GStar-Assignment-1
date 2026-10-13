@@ -99,10 +99,13 @@ def _flash_attention_forward_swa_kernel(
         s_ij = tl.where(in_window | is_sink, s_ij, -float('inf'))
 
         m_new = tl.maximum(m_i, tl.max(s_ij, axis=1))
-        alpha = tl.exp(m_i - m_new)
+        # A row can have no valid key at all in this tile - then m_i and
+        # m_new are both -inf, and exp(-inf - -inf) is NaN, not 0. Guard it.
+        no_valid_yet = m_new == -float('inf')
+        alpha = tl.where(no_valid_yet, 0.0, tl.exp(m_i - m_new))
         acc *= alpha[:, None]
         l_i *= alpha
-        p_ij = tl.exp(s_ij - m_new[:, None])
+        p_ij = tl.where(no_valid_yet[:, None], 0.0, tl.exp(s_ij - m_new[:, None]))
         l_i += tl.sum(p_ij, axis=1)
         acc += tl.dot(p_ij.to(v_block.dtype), v_block)
         m_i = m_new

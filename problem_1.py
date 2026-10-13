@@ -73,7 +73,7 @@ class FlashAttention2Function(torch.autograd.Function):
 
                         # Update the running sum and output accumulators
                         l_i = alpha * l_i + P_tilde_ij.sum(dim=-1)
-                        o_i = alpha.unsqueeze(-1) * o_i + P_tilde_ij @ V_tile
+                        o_i = alpha.unsqueeze(-1) * o_i + P_tilde_ij.to(V_tile.dtype) @ V_tile
 
                         m_i = m_new
                         # --- END OF STUDENT IMPLEMENTATION ---
